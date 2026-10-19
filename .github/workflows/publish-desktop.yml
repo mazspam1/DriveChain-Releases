@@ -1,0 +1,172 @@
+# Install this exact file as .github/workflows/publish-desktop.yml in
+# mazspam1/DriveChain-Releases. Source main requests builds through SSH tags.
+name: Build sign and publish DriveChain
+on:
+  push:
+    tags: ['build-*']
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact DriveChain main commit
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: signed-desktop-release
+  queue: max
+jobs:
+  release:
+    if: github.repository == 'mazspam1/DriveChain-Releases'
+    runs-on: windows-2025
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate source identity
+        id: source
+        env:
+          INPUT_SHA: ${{ inputs.source_sha }}
+        run: |
+          $sha = if ($env:GITHUB_EVENT_NAME -eq 'push') { $env:GITHUB_REF_NAME -replace '^build-', '' } else { $env:INPUT_SHA }
+          if ($sha -cnotmatch '^[a-f0-9]{40}$') { throw 'Expected an exact source commit' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mazspam1/DriveChain
+          ref: ${{ steps.source.outputs.sha }}
+          ssh-key: ${{ secrets.DRIVECHAIN_SOURCE_READ_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require a main-branch source commit
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Checkout differs' }
+          git merge-base --is-ancestor $env:SOURCE_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Source commit is outside main' }
+          New-Item -ItemType Directory -Force work/ci/tmp, outputs/ci | Out-Null
+          "TEMP=$env:GITHUB_WORKSPACE\work\ci\tmp" >> $env:GITHUB_ENV
+          "TMP=$env:GITHUB_WORKSPACE\work\ci\tmp" >> $env:GITHUB_ENV
+          "PIP_CACHE_DIR=$env:GITHUB_WORKSPACE\work\ci\pip-cache" >> $env:GITHUB_ENV
+          "UV_CACHE_DIR=$env:GITHUB_WORKSPACE\work\ci\uv-cache" >> $env:GITHUB_ENV
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.13'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.21.0'
+      - name: Install release-tool dependencies
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install packaging==26.2 cryptography==48.0.1 pytest==9.1.1 ruff==0.15.22
+          if ($LASTEXITCODE -ne 0) { throw 'Release tooling installation failed' }
+          rustup toolchain install 1.91.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+          rustup override set 1.91.1
+      - name: Allocate immutable update version
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          $sourceVersion = (Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          .venv/Scripts/python.exe desktop/scripts/ci_release.py plan --source-sha $env:SOURCE_SHA --source-version $sourceVersion --report outputs/ci/plan.json
+          if ($LASTEXITCODE -ne 0) { throw 'Release planning failed' }
+      - name: Verify release helpers and archive guards
+        if: steps.plan.outputs.build == 'true'
+        env:
+          # These tests own no production fixtures; avoid the model suite's GPU imports.
+          PYTEST_ADDOPTS: --confcutdir=tests/desktop
+        run: |
+          .venv/Scripts/python.exe scripts/verify/agent_check.py --checks tests lint --tests tests/desktop/test_ci_release.py tests/desktop/test_ci_build.py tests/desktop/test_ci_git.py tests/desktop/test_ci_verify.py tests/desktop/test_runtime_bundle.py --lint-paths desktop/scripts/ci_release.py desktop/scripts/ci_build.py desktop/scripts/ci_git.py desktop/scripts/ci_verify.py tests/desktop/test_ci_release.py tests/desktop/test_ci_build.py tests/desktop/test_ci_git.py tests/desktop/test_ci_verify.py --timeout 300
+          if ($LASTEXITCODE -ne 0) { throw 'Release helper verification failed' }
+      - name: Prepare all locked runtime software
+        if: steps.plan.outputs.build == 'true'
+        run: |
+          .venv/Scripts/python.exe desktop/scripts/prepare_runtime.py --root $env:GITHUB_WORKSPACE --build-root "$env:GITHUB_WORKSPACE/work/ci/rb" --output "$env:GITHUB_WORKSPACE/outputs/ci-runtime/bundle.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime preparation failed' }
+          .venv/Scripts/python.exe desktop/scripts/ci_build.py reclaim-runtime --root $env:GITHUB_WORKSPACE
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime archive validation or cleanup failed' }
+          "DRIVECHAIN_TEST_UV=$env:GITHUB_WORKSPACE\work\ci\tools\uv.exe" >> $env:GITHUB_ENV
+      - name: Build and sign the one EXE
+        if: steps.plan.outputs.build == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $keys = Join-Path $env:GITHUB_WORKSPACE 'work/ci/signing'
+          New-Item -ItemType Directory $keys | Out-Null
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY) -or [string]::IsNullOrWhiteSpace($env:SIGNING_PASSWORD)) { throw 'Signing secrets missing' }
+            [IO.File]::WriteAllText((Join-Path $keys 'key'), $env:SIGNING_KEY)
+            [IO.File]::WriteAllText((Join-Path $keys 'password'), $env:SIGNING_PASSWORD)
+            $env:SIGNING_KEY = $null
+            $env:SIGNING_PASSWORD = $null
+            & desktop/scripts/build.ps1 -Version $env:RELEASE_VERSION -AllowUnlicensed -RuntimeBundleDir "$env:GITHUB_WORKSPACE/outputs/ci-runtime" -SigningKeyPath (Join-Path $keys 'key') -SigningKeyPasswordPath (Join-Path $keys 'password')
+            if ($LASTEXITCODE -ne 0) { throw 'Signed installer build failed' }
+          } finally {
+            Remove-Item -LiteralPath $keys -Recurse -Force
+            $env:TAURI_SIGNING_PRIVATE_KEY = $null
+            $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $null
+          }
+      - name: Native release tests and reclaim build copies
+        if: steps.plan.outputs.build == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+          DRIVECHAIN_TEST_PYTHON: ${{ github.workspace }}\.venv\Scripts\python.exe
+        run: |
+          Push-Location desktop/src-tauri
+          try {
+            cargo test --release --locked
+            if ($LASTEXITCODE -ne 0) { throw 'Native release tests failed' }
+          } finally { Pop-Location }
+          .venv/Scripts/python.exe desktop/scripts/ci_build.py collect --root $env:GITHUB_WORKSPACE --version $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Signed artifact collection failed' }
+      - name: Fresh installer and offline software verification
+        if: steps.plan.outputs.build == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          .venv/Scripts/python.exe desktop/scripts/ci_verify.py --installer "outputs/ci/DriveChain_$($env:RELEASE_VERSION)_x64-setup.exe" --metadata outputs/ci/release-metadata.json --version $env:RELEASE_VERSION --root "$env:GITHUB_WORKSPACE/work/v" --report "$env:GITHUB_WORKSPACE/outputs/ci/clean-install.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Fresh installed software verification failed' }
+      - name: Check current main before publication
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          DRIVECHAIN_SOURCE_READ_KEY: ${{ secrets.DRIVECHAIN_SOURCE_READ_KEY }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          .venv/Scripts/python.exe desktop/scripts/ci_git.py source-head --root $env:GITHUB_WORKSPACE --output "$env:GITHUB_WORKSPACE/outputs/ci/source-head.json" --expected-sha $env:SOURCE_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Source main advanced; this build must not publish' }
+      - name: Publish verified latest and remove superseded releases
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRIVECHAIN_SOURCE_READ_KEY: ${{ secrets.DRIVECHAIN_SOURCE_READ_KEY }}
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          .venv/Scripts/python.exe desktop/scripts/ci_release.py publish --plan outputs/ci/plan.json --installer "outputs/ci/DriveChain_$($env:RELEASE_VERSION)_x64-setup.exe" --metadata outputs/ci/release-metadata.json --gate outputs/ci/clean-install.json --source-head outputs/ci/source-head.json --report outputs/ci/result.json
+          if ($LASTEXITCODE -ne 0) { throw 'Verified release publication failed' }
+      - name: Resume verification and cleanup of an already published source
+        if: steps.plan.outputs.resume == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRIVECHAIN_SOURCE_READ_KEY: ${{ secrets.DRIVECHAIN_SOURCE_READ_KEY }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          .venv/Scripts/python.exe desktop/scripts/ci_release.py resume --source-sha $env:SOURCE_SHA --report outputs/ci/result.json
+          if ($LASTEXITCODE -ne 0) { throw 'Public release recovery failed; preserving existing releases' }
+      - name: Save verification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-verification-${{ steps.source.outputs.sha }}
+          retention-days: 7
+          path: |
+            outputs/ci/*.json
+            outputs/ci/publication/*.json
+            artifacts/agent-verification/**
+            work/v/*.log
+          if-no-files-found: warn
